@@ -1,0 +1,34 @@
+{
+  "physics": {
+    "gravity": 1200,
+    "jumpVelocity": -550,
+    "fallGravityMultiplier": 0.18
+  },
+  "speed": {
+    "obstacleSpeed": 160,
+    "maxSpeedMultiplier": 3,
+    "speedStepPercent": 0.08,
+    "speedScoreInterval": 300
+  },
+  "obstacles": {
+    "spawnSpacing": 350,
+    "spawnMinPx": 500,
+    "spawnMaxPx": 1100,
+    "variants": {
+      "small": {
+        "scale": 0.08
+      },
+      "large": {
+        "scale": 0.13
+      }
+    }
+  },
+  "scoring": {
+    "scoreInterval": 6
+  },
+  "layout": {
+    "groundRatio": 0.85,
+    "runnerHeightRatio": 0.12,
+    "runnerXRatio": 0.15
+  }
+}

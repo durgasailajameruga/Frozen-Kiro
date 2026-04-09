@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Frozen Kiro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    #c {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+
+  <script type="module">
+    import { CONFIG } from './config.js';
+
+    // ── Canvas references ────────────────────────────────────────────────────
+    const canvas = document.getElementById('c');
+    const ctx    = canvas.getContext('2d');
+
+    // ── Layout state (set by handleResize) ───────────────────────────────────
+    let groundY   = 0;
+    let snowDots  = [];
+    let img       = null;
+    let lastTime  = 0;
+
+    // ── Mutable game state ───────────────────────────────────────────────────
+    const state = {
+      phase:        'idle',
+      score:        0,
+      highScore:    0,
+      scoreAccum:   0,
+      scoreDisplay: 'HI 00000  00000',
+      obstacles:    [],
+      speed:        0,
+      spawnTimer:   0,
+      nextSpawnIn:  0,
+      rafHandle:    null,
+      runner: {
+        x:        0,
+        y:        0,
+        vy:       0,
+        grounded: true,
+        width:    0,
+        height:   0,
+      },
+    };
+
+    // ── Animation state ──────────────────────────────────────────────────────
+    const anim = {
+      state: 'idle',
+      frame: 0,
+      accum: 0,
+    };
+
+    // ── Animation definitions ────────────────────────────────────────────────
+    const ANIM_DEFS = {
+      idle:  { start: 0,  frames: 4, loop: true  },
+      run:   { start: 4,  frames: 6, loop: true  },
+      jump:  { start: 10, frames: 3, loop: false },
+      death: { start: 13, frames: 4, loop: false },
+    };
+
+    // ── Pure utility functions ───────────────────────────────────────────────
+    function zeroPad(n, digits = 5) {
+      return String(n).padStart(digits, '0');
+    }
+    function formatScore(hi, score) {
+      return `HI ${zeroPad(hi)}  ${zeroPad(score)}`;
+    }
+    function computeSpeed(score) {
+      const steps = Math.floor(score / CONFIG.speed.speedScoreInterval);
+      const scaled = CONFIG.speed.obstacleSpeed * (1 + steps * CONFIG.speed.speedStepPercent);
+      return Math.min(scaled, CONFIG.speed.obstacleSpeed * CONFIG.speed.maxSpeedMultiplier);
+    }
+
+    // ── Audio engine ─────────────────────────────────────────────────────────
+    const audio = {
+      jump:     new Audio('assets/jump.wav'),
+      gameOver: new Audio('assets/game_over.wav'),
+      play(sound) {
+        sound.currentTime = 0;
+        sound.play().catch(() => {});
+      },
+    };
+
+    // ── Animation helpers ────────────────────────────────────────────────────
+    function setAnimState(next) {
+      if (anim.state === next) return;
+      anim.state = next;
+      anim.frame = 0;
+      anim.accum = 0;
+    }
+    function updateAnim(dt) {
+      const def = ANIM_DEFS[anim.state];
+      anim.accum += dt * 1000;
+      if (anim.accum >= CONFIG.runner.animationFrameMs) {
+        anim.accum = 0;
+        if (anim.frame < def.frames - 1) {
+          anim.frame++;
+        } else if (def.loop) {
+          anim.frame = 0;
+        }
+      }
+    }
+
+    // ── Layout / resize ──────────────────────────────────────────────────────
+    function handleResize() {
+      canvas.width  = window.innerWidth;
+      canvas.height = window.innerHeight;
+
+      groundY = canvas.height * CONFIG.layout.groundRatio;
+
+      state.runner.height = canvas.height * CONFIG.layout.runnerHeightRatio;
+      // sprite is 32×32 source — square, so width === height
+      state.runner.width  = state.runner.height;
+
+      state.runner.x = canvas.width  * CONFIG.layout.runnerXRatio;
+      state.runner.y = groundY - state.runner.height;
+
+      if (typeof initSnow === 'function') initSnow();
+    }
+
+    // ── Runner helpers ───────────────────────────────────────────────────────
+    function resetRunner() {
+      state.runner.vy = 0;
+      state.runner.grounded = true;
+      state.runner.y = groundY - state.runner.height;
+    }
+    function getHitbox(runner) {
+      const p = CONFIG.runner.hitboxPadding;
+      return {
+        x:      runner.x      + runner.width  * p.left,
+        y:      runner.y      + runner.height * p.top,
+        width:  runner.width  * (1 - p.left - p.right),
+        height: runner.height * (1 - p.top  - p.bottom),
+      };
+    }
+
+    function aabbOverlap(a, b) {
+      return (
+        a.x              < b.x + b.width  &&
+        a.x + a.width    > b.x            &&
+        a.y              < b.y + b.height &&
+        a.y + a.height   > b.y
+      );
+    }
+
+    // ── Obstacle helpers ─────────────────────────────────────────────────────
+    function spawnObstacle() {
+      const variant = Math.random() < 0.5 ? 'small' : 'large';
+      const scale   = CONFIG.obstacles.variants[variant].scale;
+      const height  = canvas.height * scale;
+      const width   = height * 0.7; // uniform aspect ratio — natural diamond shape
+
+      // Enforce minimum spacing
+      const last = state.obstacles.at(-1);
+      if (last && last.x > canvas.width - CONFIG.obstacles.spawnSpacing) return;
+
+      state.obstacles.push({
+        x: canvas.width,
+        y: groundY - height,
+        width,
+        height,
+        variant,
+      });
+    }
+    function scheduleNextSpawn() {
+      const { spawnMinPx, spawnMaxPx } = CONFIG.obstacles;
+      // Convert pixel gap to ms based on current speed — spacing stays consistent
+      // in screen distance regardless of how fast obstacles are moving.
+      const speed = state.speed || CONFIG.speed.obstacleSpeed;
+      const gapPx = spawnMinPx + Math.random() * (spawnMaxPx - spawnMinPx);
+      state.nextSpawnIn = (gapPx / speed) * 1000;
+      state.spawnTimer  = 0;
+    }
+
+    // ── Collision ────────────────────────────────────────────────────────────
+    function checkCollision() {
+      const hb = getHitbox(state.runner);
+      return state.obstacles.some(obs => aabbOverlap(hb, obs));
+    }
+
+    // ── Score / localStorage ─────────────────────────────────────────────────
+    function loadHighScore() {
+      try {
+        const stored = localStorage.getItem('frozenKiro_hi');
+        state.highScore = stored ? parseInt(stored, 10) : 0;
+      } catch (_) {
+        state.highScore = 0;
+      }
+    }
+
+    // ── Input ────────────────────────────────────────────────────────────────
+    function jump() {
+      if (!state.runner.grounded) return;
+      state.runner.vy = CONFIG.physics.jumpVelocity;
+      state.runner.grounded = false;
+      setAnimState('jump');
+      audio.play(audio.jump);
+    }
+    function handleInput() {
+      if (state.phase === 'idle')     startRun();
+      else if (state.phase === 'running')  jump();
+      else if (state.phase === 'gameover') resetGame();
+    }
+
+    // ── Game state transitions ───────────────────────────────────────────────
+    function startRun() {
+      state.phase       = 'running';
+      state.score       = 0;
+      state.scoreAccum  = 0;
+      state.scoreDisplay = formatScore(state.highScore, 0);
+      state.obstacles   = [];
+      state.speed       = CONFIG.speed.obstacleSpeed;
+      state.spawnTimer  = 0;
+      state.nextSpawnIn = CONFIG.obstacles.spawnMinMs;
+      resetRunner();
+      setAnimState('run');
+      lastTime = 0;
+      state.rafHandle = requestAnimationFrame(gameLoop);
+    }
+
+    function triggerGameOver() {
+      state.phase = 'gameover';
+      cancelAnimationFrame(state.rafHandle);
+      audio.play(audio.gameOver);
+      setAnimState('death');
+      if (state.score > state.highScore) {
+        state.highScore = state.score;
+        try { localStorage.setItem('frozenKiro_hi', state.highScore); } catch (_) {}
+      }
+      render();
+    }
+
+    function resetGame() {
+      state.obstacles = [];
+      startRun();
+    }
+
+    // ── Core loop ────────────────────────────────────────────────────────────
+    function update(dt) {
+      // Physics — asymmetric gravity: full on ascent, reduced on descent for hang time
+      if (!state.runner.grounded) {
+        const gScale = state.runner.vy > 0 ? CONFIG.physics.fallGravityMultiplier : 1;
+        state.runner.vy += CONFIG.physics.gravity * gScale * dt;
+      }
+      state.runner.y += state.runner.vy * dt;
+
+      // Ground clamp
+      if (state.runner.y >= groundY - state.runner.height) {
+        state.runner.y = groundY - state.runner.height;
+        state.runner.vy = 0;
+        if (!state.runner.grounded) {
+          state.runner.grounded = true;
+          setAnimState('run');
+        }
+      }
+
+      // Obstacle spawning
+      state.spawnTimer += dt * 1000;
+      if (state.spawnTimer >= state.nextSpawnIn) {
+        spawnObstacle();
+        scheduleNextSpawn();
+      }
+
+      // Obstacle movement and removal
+      for (const obs of state.obstacles) {
+        obs.x -= state.speed * dt;
+      }
+      state.obstacles = state.obstacles.filter(o => o.x + o.width > 0);
+
+      // Scoring (time-based, refresh-rate independent)
+      state.scoreAccum += dt;
+      const newScore = Math.floor(state.scoreAccum * (1000 / CONFIG.scoring.scoreInterval));
+      if (newScore !== state.score) {
+        state.score = newScore;
+        state.scoreDisplay = formatScore(state.highScore, state.score);
+        state.speed = computeSpeed(state.score);
+      }
+
+      // Collision detection
+      if (checkCollision()) {
+        triggerGameOver();
+        return;
+      }
+    }
+    function render() {
+      // 1. Clear
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // 2. Snow particles (background)
+      drawSnowStatic();
+
+      // 3. Ground
+      drawGround();
+
+      // 4. Obstacles
+      for (const obs of state.obstacles) {
+        drawObstacle(obs);
+      }
+
+      // 5. Runner
+      drawRunner();
+
+      // 6. HUD
+      drawHUD();
+
+      // 7. Overlay
+      if (state.phase === 'idle')     drawStartOverlay();
+      if (state.phase === 'gameover') drawGameOverOverlay();
+    }
+    function gameLoop(timestamp) {
+      if (lastTime === 0) lastTime = timestamp;
+      const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+      lastTime = timestamp;
+
+      update(dt);
+      updateAnim(dt);
+      updateSnowParticles(dt);
+      render();
+
+      if (state.phase === 'running') {
+        state.rafHandle = requestAnimationFrame(gameLoop);
+      }
+    }
+
+    // ── Rendering helpers ────────────────────────────────────────────────────
+    function drawGround() {
+      const stripH = canvas.height * 0.015;
+      const snowH  = canvas.height * 0.06;
+      // Dark strip
+      ctx.fillStyle = '#111118';
+      ctx.fillRect(0, groundY, canvas.width, stripH);
+      // Snow bank
+      ctx.fillStyle = '#c8d8f0';
+      ctx.fillRect(0, groundY + stripH, canvas.width, snowH);
+      // Snow dots
+      drawSnowDots();
+    }
+    function drawSnowDots() {
+      ctx.save();
+      ctx.fillStyle = '#ffffff';
+      ctx.globalAlpha = 0.6;
+      for (const d of snowDots) {
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    function drawObstacle(obs) {
+      ctx.save();
+      ctx.shadowColor = '#08f';
+      ctx.shadowBlur  = obs.variant === 'large' ? 24 : 16;
+      drawCrystal(ctx, obs);
+      ctx.restore();
+    }
+    function drawCrystal(ctx, obs) {
+      const cx = obs.x + obs.width  / 2;
+      const by = obs.y + obs.height;
+      const hw = obs.width  / 2;
+      const hh = obs.height / 2;
+
+      // Outer crystal shape
+      ctx.beginPath();
+      ctx.moveTo(cx,            obs.y);
+      ctx.lineTo(cx + hw,       obs.y + hh);
+      ctx.lineTo(cx + hw * 0.6, by);
+      ctx.lineTo(cx - hw * 0.6, by);
+      ctx.lineTo(cx - hw,       obs.y + hh);
+      ctx.closePath();
+      ctx.fillStyle   = '#5af';
+      ctx.strokeStyle = '#aef';
+      ctx.lineWidth   = 1.5;
+      ctx.fill();
+      ctx.stroke();
+
+      // Inner highlight facet
+      ctx.beginPath();
+      ctx.moveTo(cx,            obs.y + hh * 0.3);
+      ctx.lineTo(cx + hw * 0.4, obs.y + hh * 0.8);
+      ctx.lineTo(cx,            obs.y + hh * 1.1);
+      ctx.lineTo(cx - hw * 0.4, obs.y + hh * 0.8);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.fill();
+    }
+    function drawRunner() {
+      const rx = Math.round(state.runner.x);
+      const ry = Math.round(state.runner.y);
+
+      if (img && img.complete && img.naturalWidth > 0) {
+        // Sprite sheet is 1024×1024 — 4 cols × 4 rows, each frame 256×256.
+        // Map animation states to grid positions:
+        //   idle  frames 0–3  → grid cells 1,2 (row 0), 4,5 (row 1)
+        //   run   frames 4–9  → grid cells 4–9
+        //   jump  frames 10–12→ grid cells 8–10
+        //   death frames 13–16→ grid cells 13–15
+        // For now draw the whole image scaled to runner size (aspect-ratio safe).
+        const size = Math.min(state.runner.width, state.runner.height);
+        const offsetX = Math.round((state.runner.width  - size) / 2);
+        const offsetY = Math.round((state.runner.height - size) / 2);
+        ctx.drawImage(img, rx + offsetX, ry + offsetY, size, size);
+      } else {
+        ctx.fillStyle = '#5af';
+        ctx.fillRect(rx, ry, state.runner.width, state.runner.height);
+      }
+    }
+    function drawHUD() {
+      const pad  = canvas.width * 0.02;
+      const size = Math.max(10, canvas.width * 0.018);
+      ctx.save();
+      ctx.font         = `${size}px "Press Start 2P", monospace`;
+      ctx.fillStyle    = '#aac8f0';
+      ctx.textAlign    = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText(state.scoreDisplay, canvas.width - pad, pad);
+      ctx.restore();
+    }
+    function drawStartOverlay() {
+      drawCenteredText(ctx, canvas, 'FROZEN KIRO', 0.38, 'large');
+      drawCenteredText(ctx, canvas, 'PRESS SPACE OR TAP TO START', 0.52, 'small');
+    }
+    function drawGameOverOverlay() {
+      drawCenteredText(ctx, canvas, 'GAME OVER', 0.40, 'large');
+      drawCenteredText(ctx, canvas, 'PRESS SPACE OR TAP TO RESTART', 0.54, 'small');
+    }
+    function drawCenteredText(ctx, canvas, text, yRatio, size) {
+      const fontSize = size === 'large'
+        ? Math.max(16, canvas.width * 0.03)
+        : Math.max(10, canvas.width * 0.016);
+      ctx.save();
+      ctx.font         = `${fontSize}px "Press Start 2P", monospace`;
+      ctx.fillStyle    = '#ffffff';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, canvas.width / 2, canvas.height * yRatio);
+      ctx.restore();
+    }
+    function updateSnowParticles(dt) {
+      for (let i = 0; i < snowParticles.length; i++) {
+        const p = snowParticles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        if (p.y > groundY || p.x < -4) {
+          snowParticles[i] = makeSnowParticle(false);
+        }
+      }
+    }
+
+    function drawSnowStatic() {
+      ctx.save();
+      for (const p of snowParticles) {
+        ctx.globalAlpha = p.alpha;
+        ctx.fillStyle   = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(Math.round(p.x), Math.round(p.y), p.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // Legacy combined function (kept for compatibility)
+    function drawSnow(dt) {
+      updateSnowParticles(dt);
+      drawSnowStatic();
+    }
+    const MAX_SNOW = 40;
+    const snowParticles = [];
+
+    function makeSnowParticle(randomY = false) {
+      return {
+        x:     Math.random() * canvas.width,
+        y:     randomY ? Math.random() * canvas.height : -4,
+        r:     1 + Math.random() * 2,
+        vy:    20 + Math.random() * 40,
+        vx:   -5  - Math.random() * 10,
+        alpha: 0.4 + Math.random() * 0.5,
+      };
+    }
+
+    function initSnow() {
+      snowParticles.length = 0;
+      for (let i = 0; i < MAX_SNOW; i++) {
+        snowParticles.push(makeSnowParticle(true));
+      }
+      // Also regenerate snow dots for ground
+      snowDots = [];
+      const stripH = canvas.height * 0.015;
+      const snowH  = canvas.height * 0.06;
+      const snowTop = groundY + stripH;
+      for (let i = 0; i < 80; i++) {
+        snowDots.push({
+          x: Math.random() * canvas.width,
+          y: snowTop + Math.random() * snowH,
+          r: 1 + Math.random() * 2,
+        });
+      }
+    }
+
+    // ── Initialisation ───────────────────────────────────────────────────────
+    function init() {
+      // Load sprite
+      img = new Image();
+      img.onerror = () => { img = null; };
+      img.onload  = () => { render(); }; // redraw idle screen once sprite is ready
+      img.src = 'assets/ghosty.png';
+
+      // Load high score
+      loadHighScore();
+
+      // Resize canvas and compute layout
+      handleResize();
+
+      // Attach event listeners
+      window.addEventListener('resize', handleResize);
+      window.addEventListener('keydown', e => {
+        if (e.code === 'Space') { e.preventDefault(); handleInput(); }
+      });
+      canvas.addEventListener('touchstart', e => {
+        e.preventDefault(); handleInput();
+      }, { passive: false });
+
+      // Draw idle screen
+      render();
+    }
+
+    // ── Start the game ───────────────────────────────────────────────────────
+    init();
+  </script>
+</body>
+</html>
