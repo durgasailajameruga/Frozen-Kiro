@@ -1,8 +1,6 @@
 # Frozen Kiro
 
-A browser-based endless runner game with a retro dark aesthetic. Control a ghost sprite running along a snowy ground, jumping over glowing ice crystal obstacles. Built with vanilla JavaScript and the HTML5 Canvas API — no build step, no dependencies.
-
-![Frozen Kiro UI](img/example-ui.png)
+A browser-based endless runner game with a retro dark aesthetic. Control a olaf character sprite running along a snowy ground, jumping over glowing ice crystal obstacles. Built with vanilla JavaScript and the HTML5 Canvas API — no build step, no dependencies.
 
 ---
 
